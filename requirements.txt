@@ -1,1 +1,5 @@
-pywin32==312
+# Dépendances du script envoi_base_cm.py
+# Installation : pip install -r requirements.txt
+python-dotenv
+pyodbc
+pywin32
