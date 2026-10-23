@@ -33,13 +33,13 @@ Il retourne un **code de retour** :
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  main()  ── point d'entrée (ligne 369)                      │
+│  main()  ── point d'entrée (ligne 348)                      │
 │                                                             │
 │  1. charger_config()          → lit le fichier .env         │
 │  2. log_debut()               → ligne DEBUT dans le log     │
 │  3. identifier_archive()      → trouve le CM_*.7z du jour   │
 │  4. lire_destinataires() × 2  → listes TO et CC (Access)    │
-│  5. generer_html()            → crée le fichier text.htm    │
+│  5. obtenir_corps_html()       → génère le corps HTML du mail │
 │  6. [ModeTest ?]              → dry-run ou envoi réel       │
 │  7. GroupWiseCommander()      → envoi via GroupWise         │
 │  8. log_fin()                 → ligne FIN + durée           │
@@ -65,7 +65,7 @@ de sortie du processus (`sys.exit`).
 > que si le fichier est lancé directement (et non importé comme module).
 
 
-### 3.2 `main()` — le pilote (ligne 369)
+### 3.2 `main()` — le pilote (ligne 348)
 
 C'est la **fonction centrale** qui orchestre tout. Dans l'ordre :
 
@@ -86,29 +86,35 @@ C'est la **fonction centrale** qui orchestre tout. Dans l'ordre :
    - même appel avec `"EnvoiMail_TT_Cc_CM"` pour les destinataires **CC**.
    - si une liste est vide, une ligne `pas de destinataires TO/CC` est écrite au log.
 
-6. **`chemin_html = generer_html(config["base_dir"], date_fic)`** — génère le
-   fichier `text.htm` joint (voir §4.5).
+6. **`corps_html = obtenir_corps_html()`** — génère la chaîne HTML détaillée
+   (voir §4.5). Elle servira de **contenu du fichier `text.htm` joint**, pas de
+   corps du mail. Le chemin du fichier temporaire est calculé :
+   **`chemin_htm = os.path.join(os.path.dirname(archive), "text.htm")`**.
 
 7. **Détection du mode test** : le script vérifie la variable optionnelle
    `ModeTest` du `.env`.
-   - **Si mode test actif** : il affiche à l'écran l'archive trouvée, le HTML
-     généré, les destinataires, l'objet et les pièces jointes, *sans envoyer de
-     mail*, nettoie le HTML, écrit la ligne FIN et retourne `0`. (Voir §5.)
+   - **Si mode test actif** : il affiche à l'écran l'archive trouvée, le **corps
+     HTML** généré, les destinataires, l'objet et les pièces jointes, *sans
+     envoyer de mail*, écrit la ligne FIN et retourne `0`. (Voir §5.)
    - **Sinon** (envoi réel) : il poursuit.
 
 8. **`commander = GroupWiseCommander()`** — instancie l'objet COM
    `GroupwiseCommander` (voir §4.6).
 
-9. **`commander.envoyer_mail(...)`** — compose et envoie le courriel (voir §4.7).
+9. **`generer_html(chemin_htm)`** — écrit le corps HTML détaillé dans le fichier
+   temporaire `text.htm` (dossier de l'archive). Ce fichier sera **joint** au mail.
 
-10. **Nettoyage** : le fichier `text.htm` temporaire est supprimé
-    (`os.remove`), dans un bloc maîtrisé (si la suppression échoue, on ignore
-    l'erreur car ce n'est pas bloquant).
+10. **`commander.envoyer_mail(to_liste, cc_liste, SUJET_MAIL, corps=CORPS_MAIL,
+    pieces_jointes=[archive, chemin_htm])`** — compose et envoie le courriel
+    (voir §4.6). **Deux pièces jointes** : l'archive `.7z` et `text.htm`.
 
-11. **`log_fin(fic_log, ddebut)`** — écrit la ligne `FIN...` (avec durée) dans le
+11. **`finally` : `os.remove(chemin_htm)`** — supprime le fichier temporaire
+    `text.htm` après l'usage (même si l'envoi a échoué).
+
+12. **`log_fin(fic_log, ddebut)`** — écrit la ligne `FIN...` (avec durée) dans le
     log (voir §4.8).
 
-12. **`print("Envoi effectué avec succès.")`** et **`return 0`**.
+13. **`print("Envoi effectué avec succès.")`** et **`return 0`**.
 
 ### 3.3 Gestion des erreurs dans `main()`
 
@@ -148,7 +154,7 @@ Tout le corps de `main()` est enveloppé dans un `try / except Exception` :
 - Écrit dans le fichier de log une ligne encadrée par `SEP_LOG`
   (`SEP_LOG = "*" * 55`, soit 55 astérisques) indiquant
   `DEBUT création base hors-ligne - Envoi par mail...`.
-- L'écriture passe par le petit utilitaire `_writelog` (voir §4.9).
+- L'écriture passe par le petit utilitaire `_writelog` (voir §4.8).
 
 ### 4.3 `identifier_archive(rep_fic, date_fic)` (ligne 165) — trouve le `.7z`
 
@@ -201,32 +207,40 @@ Fonctionnement :
 > exécuté quoi qu'il arrive.
 
 
-### 4.5 `generer_html(base_dir, date_ficjour)` (ligne 248) — corps HTML du mail
+### 4.5 `obtenir_corps_html()` (ligne 257) et `generer_html()` (ligne 287)
 
-Reconstruit, dans le langage Python, le corps **HTML** que la macro VBA générait
-(pièce jointe `text.htm` envoyée avec l'archive) :
+Le corps HTML **détaillé** (lien cliquable compris, reproduit du VBA d'origine) est
+généré **dans un fichier `text.htm` joint** — et non inséré dans le corps du mail
+(voir la justification en §4.6).
+
+#### `obtenir_corps_html()` — retourne la chaîne HTML
 
 - Formate la date du jour au format `%d/%m/%Y`.
-- Construit le chemin de sortie : `os.path.join(base_dir, "text.htm")`.
-- Assemble une chaîne de caractères `html` :
-  - un en-tête avec `content="Novell Groupwise Client..."` (reprise du VBA) et
-    `charset=utf-8` ;
+- Construit la chaîne `html` consolidée :
+  - un `<head>` avec les meta `Generator` (Novell Groupwise Client 14.2.1
+    Build: 124595) et `Content-Type` `text/html; charset=utf-8` (identiques au
+    HTML du VBA d'origine) ;
   - un `<body>` contenant les messages d'accompagnement (base « hors ligne »,
-    consignes d'utilisation, lien de copie des fichiers Excel défini par la
+    consignes d'utilisation, **lien de copie** des fichiers Excel défini par la
     constante `LIEN_COPIE_EXCEL`), terminé par `Frédéric Rannou`.
-- Écrit le contenu dans `text.htm` avec l'**encodage UTF-8**.
-- **Retourne** le chemin du fichier généré.
+- **Retourne** la chaîne HTML (aucun fichier écrit).
 
-> **Notion Python** : `open(..., "w", encoding="utf-8")` crée/écrase le fichier
-> en mode écriture texte. Le `with` ferme automatiquement le fichier à la fin du
-> bloc, même en cas d'erreur.
+#### `generer_html(chemin_htm)` — écrit le fichier `text.htm`
 
-### 4.6 `GroupWiseCommander` (classe, ligne 295) — pilotage de GroupWise
+- Écrit `obtenir_corps_html()` dans le fichier `chemin_htm` en **UTF-8**.
+- **Retourne** `chemin_htm`.
+
+> **Contexte** : le VBA/Access écrivait ce HTML dans `text.htm` puis l'ajoutait en
+> pièce jointe — le corps du message ne contenant que le signataire. On reproduit
+> exactement ce comportement car le token `TextSetMessage` **rejette les balises
+> `<a>`** (voir §4.6).
+
+### 4.6 `GroupWiseCommander` (classe, ligne 300) — pilotage de GroupWise
 
 Encapsule l'objet **OLE COM** `GroupwiseCommander` (le remplaçant moderne de
 `NovellGroupWareSession`).
 
-#### `__init__` (ligne 298)
+#### `__init__` (ligne 303)
 
 - Instancie l'objet COM : `win32com.client.Dispatch("GroupwiseCommander")`.
 - En cas d'échec, lève une `RuntimeError` expliquant qu'il faut GroupWise 32
@@ -235,7 +249,7 @@ Encapsule l'objet **OLE COM** `GroupwiseCommander` (le remplaçant moderne de
 > **Pourquoi 32 bits ?** L'objet OLE `GroupwiseCommander` n'est disponible que
 > dans un environnement 32 bits : d'où l'obligation d'utiliser Python x86.
 
-#### `executer(commande)` (ligne 308) — exécute un token GroupWise
+#### `executer(commande)` (ligne 313) — exécute un token GroupWise
 
 - Appelle `self.commander.Execute(commande, ret_string)`.
 - `Execute` renvoie `1` en cas de succès, `0` en cas d'échec. Le résultat peut
@@ -244,7 +258,7 @@ Encapsule l'objet **OLE COM** `GroupwiseCommander` (le remplaçant moderne de
 - Si le renvoi est `0`/faux → `RuntimeError` avec la commande et le détail.
 - **Retourne** la chaîne de retour en cas de succès.
 
-#### `envoyer_mail(to_liste, cc_liste, sujet, corps, pieces_jointes)` (ligne 332)
+#### `envoyer_mail(to_liste, cc_liste, sujet, corps, pieces_jointes)` (ligne 337)
 
 Séquence de **tokens GroupWise** exécutés dans l'ordre :
 
@@ -252,17 +266,33 @@ Séquence de **tokens GroupWise** exécutés dans l'ordre :
 2. `TextSetTo("<mails séparés par des virgules>")` — remplit le champ **TO**.
 3. `TextSetCC("<mails séparés par des virgules>")` — remplit le champ **CC**.
 4. `TextSetSubject("<sujet>")` — définit l'**objet** du mail.
-5. `TextSetMessage("<corps>")` — définit le **corps** du mail (ici simplement
-   `"Frédéric Rannou"` ; le contenu détaillé est dans `text.htm` joint).
-6. Pour chaque pièce jointe (`text.htm` puis l'archive `.7z`) :
+5. `TextSetMessage("<corps>")` — insère le corps : la constante **`CORPS_MAIL`**
+   (`"Frédéric Rannou"`), un **texte simple** (pas du HTML). Le HTML détaillé
+   (lien cliquable) est joint via le fichier `text.htm`.
+6. Pour chaque pièce jointe — **deux** : l'archive `.7z` **et** le fichier
+   `text.htm` :
    - vérifie que le fichier existe (`os.path.isfile`) sinon `FileNotFoundError` ;
    - exécute `AttachmentAdd("<chemin>")`.
 7. `ItemSend()` — **envoie** le message.
 
-> Les valeurs insérées dans les commandes sont **échappées** (les guillemets
-> `"` sont remplacés par `\"`) pour éviter de casser la syntaxe du token.
+> **Pourquoi un corps simple + `text.htm` ?** Le parseur de token GroupWise
+> **rejette** `TextSetMessage` dès qu'elle contient une balise `<a href="...">`
+> (démontré par un diagnostic progressif : un HTML avec `<div>`, `<br>`, accents et
+> guillemets échappés passe, mais **échoue dès l'ajout du lien**). Le HTML complet
+> avec lien est donc fourni en **pièce jointe `text.htm`** (approche identique au
+> VBA/Access d'origine), et le corps ne porte qu'un texte simple. `SwitchToHTMLView`
+> n'est plus utilisé.
 
-### 4.7 `log_fin(fic_log, ddebut)` (ligne 111) — ligne FIN + durée
+> Les valeurs insérées dans les commandes sont **échappées** pour que le parseur de
+> token GroupWise accepte la commande :
+> - pour les **chemins** des pièces jointes (l'archive `.7z` et `text.htm`, avec les
+>   backslashes du dossier) : les **backslashes** `\` sont **doublés** `\\` pour être
+>   lus comme un `\` littéral — sans cela GroupWise les interprète comme des
+>   séquences d'échappement et le token **échoue** ;
+> - pour le **corps simple** `CORPS_MAIL` (`"Frédéric Rannou"`) : rien à échapper,
+>   on applique par sécurité un échappement des guillemets `"` → `\"`.
+
+### 4.7 `log_fin(fic_log, ddebut)` (ligne 120) — ligne FIN + durée
 
 - Formate la date/heure courante.
 - Calcule la **durée** : `datetime.datetime.now() - ddebut` (un objet
@@ -271,7 +301,7 @@ Séquence de **tokens GroupWise** exécutés dans l'ordre :
   heures, puis minutes, puis secondes).
 - Écrit la ligne `FIN... (HH:MM:SS)` dans le log.
 
-### 4.8 `_writelog(fic_log, texte)` (ligne 89) — écriture dans le log
+### 4.8 `_writelog(fic_log, texte)` (ligne 98) — écriture dans le log
 
 - Avec `locale.getpreferredencoding(False)`, détermine l'encodage de l'OS
   (ANSI/Windows-1252 sous Windows), identique à celui utilisé par Access afin de
@@ -291,14 +321,16 @@ Séquence de **tokens GroupWise** exécutés dans l'ordre :
 Si la variable `ModeTest` du `.env` vaut une valeur « vrai » (`1`, `true`,
 `oui`, `yes`, `dryrun`, `test`…), `main()` :
 
-1. Affiche à l'écran : l'archive `.7z` identifiée, le `text.htm` généré, les
-   destinataires TO/CC, l'objet et les pièces jointes.
+1. Affiche à l'écran : l'archive `.7z` identifiée, le **contenu HTML** (ce qui
+   serait écrit dans `text.htm`), les destinataires TO/CC, l'objet, le **corps**
+   simple `CORPS_MAIL` et les **pièces jointes prévues** (l'archive `.7z` +
+   `text.htm`).
 2. **N'exécute aucune commande GroupWise** (pas d'envoi).
-3. Supprime le `text.htm` temporaire.
-4. Écrit la ligne `FIN` au log et retourne `0`.
+3. Écrit la ligne `FIN` au log et retourne `0`.
 
 Cela permet de **valider la configuration** (`.env`, archive, destinataires,
-HTML) sans risquer un envoi réel.
+HTML) sans risquer un envoi réel. En mode test, **aucun fichier temporaire**
+(`text.htm`) n'est créé ni supprimé.
 
 ---
 
@@ -314,18 +346,19 @@ envoi_base_cm.py
 │    ├─ identifier_archive()       (glob, datetime)
 │    ├─ lire_destinataires("...To_CM")  ──> _trouver_pilote_access() , pyodbc
 │    ├─ lire_destinataires("...Cc_CM")  ──> _trouver_pilote_access() , pyodbc
-│    ├─ generer_html()                      (écrit text.htm)
-│    ├─ [ModeTest ?] → print + return 0
+│    ├─ obtenir_corps_html()                  (retourne la chaîne HTML)
+│    ├─ generer_html(chemin_htm)              (non testé : écrit text.htm)
+│    ├─ [ModeTest ?] → print + return 0       (test : text.htm non créé)
 │    ├─ GroupWiseCommander()
-│    │     └─ envoyer_mail()
+│    │     └─ envoyer_mail(corps=CORPS_MAIL, pieces_jointes=[archive, chemin_htm])
 │    │           ├─ executer("NewMail()")
 │    │           ├─ executer("TextSetTo...")
 │    │           ├─ executer("TextSetCC...")
 │    │           ├─ executer("TextSetSubject...")
-│    │           ├─ executer("TextSetMessage...")
-│    │           ├─ executer("AttachmentAdd...") × 2
+│    │           ├─ executer("TextSetMessage(CORPS_MAIL)")   (texte simple)
+│    │           ├─ executer("AttachmentAdd...") × 2  (archive .7z + text.htm)
 │    │           └─ executer("ItemSend()")
-│    ├─ os.remove(text.htm)
+│    ├─ finally : os.remove(chemin_htm)       (supprime text.htm)
 │    └─ log_fin() ──> _writelog()
 │
 └─ return 0 (ou 1 si exception)
@@ -337,10 +370,10 @@ envoi_base_cm.py
 
 | Notion | Explication courte | Exemple dans le code |
 |--------|--------------------|----------------------|
-| `if __name__ == "__main__"` | Exécution seulement en lancement direct | ligne 463 |
+| `if __name__ == "__main__"` | Exécution seulement en lancement direct | ligne 432 |
 | `try / except` | Gestion des erreurs | `main()`, `GroupWiseCommander` |
 | `try / finally` | Toujours fermer (connexion) | `lire_destinataires` |
-| `with open(...)` | Ouverture auto-fermée d'un fichier | `_writelog`, `generer_html` |
+| `with open(...)` | Ouverture auto-fermée d'un fichier | `_writelog` |
 | mode `"a"` (append) | Ajout en fin de fichier | `_writelog` |
 | `glob.glob` | Recherche par motif `*` | `identifier_archive` |
 | `max(..., key=...)` | Élément max selon une clé | `identifier_archive` |

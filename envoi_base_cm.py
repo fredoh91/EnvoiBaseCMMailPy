@@ -23,8 +23,9 @@ Bibliothèques requises :
     pywin32, python-dotenv, pyodbc (+ pilote Microsoft Access)
 
 Configuration (fichier .env, variables) :
-    RepFicAenvoyer     = dossier contenant l'archive .7z (finissant par un backslash)
+    RepFicAenvoyer     = dossier contenant l'archive .7z et le fichier Word (finissant par un backslash)
     DateFicAenvoyer    = "today" (date du jour) OU date exacte "AAAAMMJJ"
+    NomFichierWord     = nom du fichier Word (mode opératoire) présent dans RepFicAenvoyer
     BaseUsers          = chemin complet de la base Access (table TbUsers)
     FicLog             = chemin complet du fichier de log commun (mode append)
 
@@ -34,6 +35,7 @@ Sortie :
 
 import os
 import sys
+import re
 import glob
 import locale
 import datetime
@@ -140,6 +142,7 @@ def charger_config():
     valeurs = {
         "RepFicAenvoyer": os.getenv("RepFicAenvoyer"),
         "DateFicAenvoyer": os.getenv("DateFicAenvoyer"),
+        "NomFichierWord": os.getenv("NomFichierWord"),
         "BaseUsers": os.getenv("BaseUsers"),
         "FicLog": os.getenv("FicLog"),
         # Optionnel : 1 / true / dryrun => TEST sans envoi réel du mail
@@ -186,6 +189,39 @@ def identifier_archive(rep_fic, date_fic):
 
     # Le plus récent si plusieurs fichiers correspondent au motif
     return os.path.abspath(max(candidats, key=os.path.getmtime))
+
+
+# ---------------------------------------------------------------------------
+# Extraction de la date depuis le nom d'une archive CM_AAAAMMJJ_HHMMSS.7z
+# ---------------------------------------------------------------------------
+def extraire_date_archive(chemin_archive):
+    """Extrait et renvoie (AAAAMMJJ, HHMMSS, date_affichage) depuis le nom.
+
+    Le nom attendu est de la forme CM_AAAAMMJJ_HHMMSS.7z (ex. CM_20261002_233513.7z).
+    Renvoie :
+      - date_aaaammjj : "AAAAMMJJ" (ex. "20261002")
+      - heure_hhmmss   : "HHMMSS"   (ex. "233513")
+      - date_affichage : "JJ/MM/AAAA" (ex. "02/10/2026") pour le corps du mail.
+
+    Lève RuntimeError si le nom ne correspond pas au motif attendu.
+    """
+    nom = os.path.basename(chemin_archive)
+    # CM_AAAAMMJJ_HHMMSS.7z  ->  capture "AAAAMMJJ" et "HHMMSS"
+    m = re.match(r"^CM_(\d{8})_(\d{6})\.7z$", nom)
+    if not m:
+        raise RuntimeError(
+            f"Impossible d'extraire la date du nom d'archive '{nom}'. "
+            "Format attendu : CM_AAAAMMJJ_HHMMSS.7z"
+        )
+    date_aaaammjj = m.group(1)
+    heure_hhmmss = m.group(2)
+    try:
+        date_affichage = datetime.datetime.strptime(
+            date_aaaammjj, "%Y%m%d"
+        ).strftime("%d/%m/%Y")
+    except ValueError:
+        date_affichage = f"{date_aaaammjj[6:8]}/{date_aaaammjj[4:6]}/{date_aaaammjj[0:4]}"
+    return date_aaaammjj, heure_hhmmss, date_affichage
 
 
 # ---------------------------------------------------------------------------
@@ -243,55 +279,51 @@ def lire_destinataires(base_users, champ_bool):
 
 
 # ---------------------------------------------------------------------------
-# Génération du fichier HTML joint (corps HTML), reproduit du VBA
-# ---------------------------------------------------------------------------
-def generer_html(base_dir, date_ficjour):
-    """Génère le fichier 'text.htm' reproduisant le HTML du VBA d'origine.
-
-    Retourne le chemin complet du fichier généré.
-    """
-    # date_ficjour paramétrée (non utilisée pour le texte, la date du jour
-    # est affichée comme dans le VBA via sDateDuJour)
-    jour = datetime.date.today().strftime("%d/%m/%Y")
-
-    chemin_html = os.path.join(base_dir, "text.htm")
-
-    entete = (
-        '<meta name="Generator" content="Novell Groupwise Client '
-        '(Version 14.2.1  Build: 124595)">'
-        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>'
-    )
-
-    html = (
-        "<html><head>\n"
-        + entete
-        + "\n"
-        "<body>\n"
-        f'<div>Voici la base cas marquant "hors ligne" du {jour} au soir '
-        "ainsi que son mode opératoire.</div><div><br></div>\n"
-        "<div>Si vous désirez modifier un cas marquant, vous devez "
-        "impérativement, utiliser la dernière base envoyée, il s'agit de la "
-        "plus à jour.</div><div><br></div>\n"
-        "<div>Il est également nécessaire d’envoyer les fichiers générés le "
-        "jour même, et ainsi réduire le risque de collisions de modification "
-        "(modifications du même cas marquant par deux utilisateurs "
-        "différents).</div><div><br></div>\n"
-        f'<div>Merci de copier les fichiers Excel dans le répertoire suivant : '
-        f'<a href="{LIEN_COPIE_EXCEL}">{LIEN_COPIE_EXCEL}</a></div>'
-        "<div><br></div>\n"
-        "<div>Frédéric Rannou<br></div></div>\n"
-        "</body></html>\n"
-    )
-
-    with open(chemin_html, "w", encoding="utf-8") as fh:
-        fh.write(html)
-
-    return chemin_html
-
-
-# ---------------------------------------------------------------------------
 # Enveloppe de pilotage GroupWise (tokens GroupwiseCommander)
 # ---------------------------------------------------------------------------
+def _echapper_pour_cmd(texte, mono_ligne=True):
+    """Prépare une chaîne destinée à être passée comme argument d'un token
+    GroupWise entre guillemets doubles.
+
+    - double les backslashes :  \\  ->  \\\\   (chemins Windows)
+    - échappe les guillemets :  "   ->  \\"
+    - si mono_ligne : remplace les retours à la ligne (CR/LF) et espaces
+      multiples par un espace unique, afin de garder la commande sur UNE
+      ligne (le parseur GroupWise/DDE ignore une commande à la syntaxe
+      invalide, notamment si elle est coupée par un retour à la ligne).
+    """
+    if mono_ligne:
+        import re as _re
+        texte = _re.sub(r"\s+", " ", texte).strip()
+    texte = texte.replace("\\", "\\\\").replace('"', '\\"')
+    return texte
+
+
+def _decouper_corps(texte, taille_max=200):
+    """Découpe `texte` (déjà aplati sur une ligne) en segments de taille
+    <= `taille_max`, sans couper un mot au milieu.
+
+    GroupWise rejette une commande `TextSetMessage(...)` trop longue
+    (seuil constaté d'environ 350-400 caractères selon le contenu). On
+    contourne la limite en envoyant plusieurs `TextSetMessage` successifs
+    avec `Append`, chaque segment restant bien sous le seuil.
+    """
+    mots = texte.split(" ")
+    segments = []
+    courant = ""
+    for mot in mots:
+        if not courant:
+            courant = mot
+        elif len(courant) + 1 + len(mot) <= taille_max:
+            courant += " " + mot
+        else:
+            segments.append(courant)
+            courant = mot
+    if courant:
+        segments.append(courant)
+    return segments
+
+
 class GroupWiseCommander:
     """Encapsule l'objet OLE GroupwiseCommander et l'exécution des tokens."""
 
@@ -347,16 +379,28 @@ class GroupWiseCommander:
         # 4. Objet du message
         self.executer(f'TextSetSubject("{sujet}")')
 
-        # 5. Corps du message (le VBA envoie "Frédéric Rannou" comme corps,
-        #    le contenu détaillé étant généré dans text.htm joint en pièce jointe)
-        corps_echappe = corps.replace('"', '\\"')
-        self.executer(f'TextSetMessage("{corps_echappe}")')
+        # 5. Corps du message (TEXTE SIMPLE).
+        #    GroupWise rejette un TextSetMessage trop long (> ~350-400 car.).
+        #    On contourne la limite en découpant le corps en plusieurs
+        #    TextSetMessage successifs : le 1er sans Append, les suivants
+        #    avec Append=TRUE (qui ajoute au message existant).
+        corps_plat = _echapper_pour_cmd(corps, mono_ligne=True)
+        segments = _decouper_corps(corps_plat, taille_max=200)
+        for idx, segment in enumerate(segments):
+            # Le texte est déjà mono-ligne ; on échappe sans re-normaliser.
+            echappe = _echapper_pour_cmd(segment, mono_ligne=False)
+            if idx == 0:
+                self.executer(f'TextSetMessage("{echappe}")')
+            else:
+                self.executer(f'TextSetMessage("{echappe}"; TRUE)')
 
-        # 6. Pièces jointes (AttachmentAdd prend directement le chemin du fichier)
+        # 6. Pièces jointes (AttachmentAdd prend le chemin complet du fichier).
+        #    On double les backslashes du chemin et on échappe les guillemets,
+        #    sans écraser les espaces éventuels du nom de fichier.
         for chemin in pieces_jointes:
             if not os.path.isfile(chemin):
                 raise FileNotFoundError(f"Pièce jointe introuvable : {chemin}")
-            chemin_safe = chemin.replace('"', '\\"')
+            chemin_safe = _echapper_pour_cmd(chemin, mono_ligne=False)
             self.executer(f'AttachmentAdd("{chemin_safe}")')
 
         # 7. Envoi du message (ItemSend() sans argument envoie le message ouvert)
@@ -393,8 +437,34 @@ def main():
         if not cc_liste:
             _writelog(fic_log, "pas de destinataires CC ")
 
-        # --- 3. Génération du fichier HTML joint ---
-        chemin_html = generer_html(config["base_dir"], date_fic)
+        # --- 3. Pièces jointes à envoyer ---
+        #   - l'archive .7z identifiée ci-dessus
+        #   - le fichier Word (mode opératoire) dont le nom vient du .env,
+        #     situé dans le dossier RepFicAenvoyer
+        fichier_word = os.path.join(rep_fic, config["NomFichierWord"])
+        if not os.path.isfile(fichier_word):
+            raise FileNotFoundError(
+                f"Fichier Word introuvable dans '{rep_fic}' : "
+                f"{config['NomFichierWord']}"
+            )
+        pieces_jointes = [archive, fichier_word]
+
+        # Date affichée dans le corps du mail, extraite du nom de l'archive
+        _, _, date_archive = extraire_date_archive(archive)
+
+        # --- Corps du mail (texte simple, la date est rendue dynamiquement) ---
+        corps_texte = (
+            f"Voici la base cas marquant \"hors ligne\" du {date_archive} au soir "
+            "ainsi que son mode opératoire.\n\n"
+            "Si vous désirez modifier un cas marquant, vous devez impérativement, "
+            "utiliser la dernière base envoyée, il s'agit de la plus à jour.\n\n"
+            "Il est également nécessaire d’envoyer les fichiers générés le jour même, "
+            "et ainsi réduire le risque de collisions de modification "
+            "(modifications du même cas marquant par deux utilisateurs différents).\n\n"
+            "Merci de copier les fichiers Excel dans le répertoire suivant : "
+            "G:\\DM-SURVEIL\\MEDICAMENTS\\BASES\\BASE_CM\\Import_TT\\ImportExcel_TT\\PROD\\aFaire\\\n\n"
+            "Frédéric Rannou"
+        )
 
         mode_test = str(config.get("ModeTest", "")).strip().lower() in (
             "1", "true", "oui", "o", "yes", "y", "dryrun", "test"
@@ -406,19 +476,35 @@ def main():
             print("MODE TEST (dry-run) : validation sans envoi de mail.")
             print("-" * 60)
             print(f"Archive .7z identifiée : {archive}")
-            print(f"Fichier HTML généré    : {chemin_html}")
+            print(f"Fichier Word            : {fichier_word}")
+            print(f"Date extraite (archive) : {date_archive}")
             print(f"Destinataires TO ({len(to_liste)}) : {', '.join(to_liste) if to_liste else '(aucun)'}")
             print(f"Destinataires CC ({len(cc_liste)}) : {', '.join(cc_liste) if cc_liste else '(aucun)'}")
             print(f"Objet du mail          : {SUJET_MAIL}")
-            print(f"Pièces jointes         : {chemin_html}, {archive}")
+            print(f"Pièces jointes         : {archive}")
+            print(f"                         {fichier_word}")
+            print("-" * 60)
+            # Reconstruit les commandes GroupWise (sans les exécuter) pour
+            # vérifier que le corps et les pièces jointes sont bien formatés.
+            print("Commandes GroupWise qui seraient envoyées :")
+            print(f"  NewMail()")
+            print(f"  TextSetTo(\"{_echapper_pour_cmd(','.join(to_liste), mono_ligne=False) if to_liste else ''}\")")
+            print(f"  TextSetSubject(\"{_echapper_pour_cmd(SUJET_MAIL, mono_ligne=False)}\")")
+            corps_plat = _echapper_pour_cmd(corps_texte, mono_ligne=True)
+            segments = _decouper_corps(corps_plat, taille_max=200)
+            for idx_seg, segment in enumerate(segments):
+                echappe_seg = _echapper_pour_cmd(segment, mono_ligne=False)
+                if idx_seg == 0:
+                    print(f"  TextSetMessage(\"{echappe_seg}\")")
+                else:
+                    print(f"  TextSetMessage(\"{echappe_seg}\"; TRUE)")
+            for chemin in pieces_jointes:
+                print(f"  AttachmentAdd(\"{_echapper_pour_cmd(chemin, mono_ligne=False)}\")")
+            print(f"  ItemSend()")
+            print("  [corps découpé en {} segment(s) de ≤200 caractères]".format(len(segments)))
             print("-" * 60)
             print("Le mail n'a PAS été envoyé (mode test).")
             print("=" * 60)
-            # Nettoyage du fichier HTML temporaire
-            try:
-                os.remove(chemin_html)
-            except OSError:
-                pass
             log_fin(fic_log, ddebut)
             return 0
 
@@ -428,15 +514,15 @@ def main():
             to_liste=to_liste,
             cc_liste=cc_liste,
             sujet=SUJET_MAIL,
-            corps="Frédéric Rannou",
-            pieces_jointes=[chemin_html, archive],
+            corps=corps_texte,
+            pieces_jointes=pieces_jointes,
         )
 
-        # Nettoyage du fichier HTML temporaire
-        try:
-            os.remove(chemin_html)
-        except OSError:
-            pass
+        # Nettoyage du fichier HTML temporaire (plus de fichier HTML généré)
+        # try:
+        #     os.remove(chemin_html)
+        # except OSError:
+        #     pass
 
         # --- 5. Fin de traitement (ligne FIN + durée) ---
         log_fin(fic_log, ddebut)

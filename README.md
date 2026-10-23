@@ -17,8 +17,11 @@ le démarrage du traitement Access (via le Planificateur de tâches Windows) et 
 1. Identifie l'archive `.7z` du jour dans le dossier `RepFicAenvoyer`.
 2. Lit la liste des destinataires **TO** et **CC** dans la table `TbUsers` de la
    base Access (`BaseUsers`).
-3. Génère le fichier HTML joint (`text.htm`) reproduisant le corps HTML du VBA.
-4. Compose et **envoie** le courriel via l'objet OLE `GroupwiseCommander`.
+3. Génère le corps HTML détaillé dans un **fichier temporaire `text.htm`**
+   (reproduit du HTML du VBA/Access), qui sera **joint** au courriel.
+4. Compose et **envoie** le courriel via l'objet OLE `GroupwiseCommander` : le
+   corps du message est un **texte simple** (`Frédéric Rannou`), le HTML détaillé
+   (lien cliquable compris) étant la pièce jointe `text.htm`.
 5. Journalise le tout dans un fichier de log commun (mode **append**).
 
 Retour : **0** si succès, **1** en cas d'erreur.
@@ -136,10 +139,19 @@ est ajoutée au log et le script retourne **1**.
 
 - **Objet** :
   `Base Cas marquants hors ligne pour saisie par DP et DS/Sécurisation en période de télétravail`
-- **Corps** : `Frédéric Rannou` (comme dans le VBA d'origine).
-- **Pièces jointes** :
-  1. `text.htm` (corps HTML généré, reproduit du VBA),
-  2. l'archive `CM_AAAAMMJJ_HHMMSS.7z`.
+- **Corps** : texte simple `Frédéric Rannou` (le signataire). Le HTML détaillé
+  n'est **pas** inséré dans le corps du mail.
+- **Pièces jointes** : l'archive `CM_AAAAMMJJ_HHMMSS.7z` **plus** le fichier
+  temporaire `text.htm` (supprimé après l'envoi).
+- Le fichier `text.htm` contient le **HTML complet** (base « hors ligne »,
+  consignes, **lien cliquable** de copie des fichiers Excel) reproduit du VBA
+  d'origine.
+
+> Ce choix (corps simple + HTML en pièce jointe `text.htm`) reproduit exactement
+> le comportement du VBA/Access d'origine et contourne la **limite du token
+> `TextSetMessage`** de GroupWise qui **rejette les balises `<a>`** dans le corps
+> (démontré par un diagnostic progressif : `TextSetMessage` accepte `<div>`,
+> `<br>`, accents et guillemets échappés, mais **échoue dès qu'on ajoute un lien**).
 
 > Conformément au choix retenu, **aucun fichier mode opératoire** n'est joint.
 
