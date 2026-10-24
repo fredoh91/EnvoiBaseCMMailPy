@@ -63,9 +63,10 @@ except ImportError:  # pragma: no cover
 
 try:
     import win32com.client
+    import win32clipboard
 except ImportError:  # pragma: no cover
     sys.stderr.write(
-        "ERREUR : la bibliothèque 'pywin32' est requise (module win32com).\n"
+        "ERREUR : la bibliothèque 'pywin32' est requise (modules win32com et win32clipboard).\n"
         "Installez-la avec : pip install pywin32\n"
     )
     sys.exit(1)
@@ -379,20 +380,23 @@ class GroupWiseCommander:
         # 4. Objet du message
         self.executer(f'TextSetSubject("{sujet}")')
 
-        # 5. Corps du message (TEXTE SIMPLE).
-        #    GroupWise rejette un TextSetMessage trop long (> ~350-400 car.).
-        #    On contourne la limite en découpant le corps en plusieurs
-        #    TextSetMessage successifs : le 1er sans Append, les suivants
-        #    avec Append=TRUE (qui ajoute au message existant).
-        corps_plat = _echapper_pour_cmd(corps, mono_ligne=True)
-        segments = _decouper_corps(corps_plat, taille_max=200)
-        for idx, segment in enumerate(segments):
-            # Le texte est déjà mono-ligne ; on échappe sans re-normaliser.
-            echappe = _echapper_pour_cmd(segment, mono_ligne=False)
-            if idx == 0:
-                self.executer(f'TextSetMessage("{echappe}")')
-            else:
-                self.executer(f'TextSetMessage("{echappe}"; TRUE)')
+        # 5. Corps du message injecté via le presse-papier Windows (Option 1).
+        #    Cette méthode préserve fidèlement les sauts de ligne (CRLF)
+        #    et s'affranchit des limites de longueur et de syntaxe du parseur
+        #    DDE de GroupWise (pas de troncature ni de commande coupée par \n).
+        texte_presse_papier = corps.replace("\r\n", "\n").replace("\n", "\r\n")
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(
+                win32clipboard.CF_UNICODETEXT, texte_presse_papier
+            )
+        finally:
+            win32clipboard.CloseClipboard()
+
+        # Donne le focus au corps du message (10 = Message) et colle le texte
+        self.executer("FocusSet(10)")
+        self.executer("EditPaste()")
 
         # 6. Pièces jointes (AttachmentAdd prend le chemin complet du fichier).
         #    On double les backslashes du chemin et on échappe les guillemets,
@@ -490,18 +494,12 @@ def main():
             print(f"  NewMail()")
             print(f"  TextSetTo(\"{_echapper_pour_cmd(','.join(to_liste), mono_ligne=False) if to_liste else ''}\")")
             print(f"  TextSetSubject(\"{_echapper_pour_cmd(SUJET_MAIL, mono_ligne=False)}\")")
-            corps_plat = _echapper_pour_cmd(corps_texte, mono_ligne=True)
-            segments = _decouper_corps(corps_plat, taille_max=200)
-            for idx_seg, segment in enumerate(segments):
-                echappe_seg = _echapper_pour_cmd(segment, mono_ligne=False)
-                if idx_seg == 0:
-                    print(f"  TextSetMessage(\"{echappe_seg}\")")
-                else:
-                    print(f"  TextSetMessage(\"{echappe_seg}\"; TRUE)")
+            print("  [Copie du corps dans le presse-papier Windows (CF_UNICODETEXT) avec sauts de ligne réels]")
+            print("  FocusSet(10)")
+            print("  EditPaste()")
             for chemin in pieces_jointes:
                 print(f"  AttachmentAdd(\"{_echapper_pour_cmd(chemin, mono_ligne=False)}\")")
             print(f"  ItemSend()")
-            print("  [corps découpé en {} segment(s) de ≤200 caractères]".format(len(segments)))
             print("-" * 60)
             print("Le mail n'a PAS été envoyé (mode test).")
             print("=" * 60)
