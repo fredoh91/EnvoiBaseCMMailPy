@@ -111,8 +111,8 @@ C'est la **fonction centrale** qui orchestre tout. Dans l'ordre :
 11. **`finally` : `os.remove(chemin_htm)`** — supprime le fichier temporaire
     `text.htm` après l'usage (même si l'envoi a échoué).
 
-12. **`log_fin(fic_log, ddebut)`** — écrit la ligne `FIN...` (avec durée) dans le
-    log (voir §4.8).
+12. **`log_fin(fichiers, ddebut)`** — écrit la ligne `FIN...` (avec durée) dans le(s)
+    fichier(s) de log (voir §4.8).
 
 13. **`print("Envoi effectué avec succès.")`** et **`return 0`**.
 
@@ -141,20 +141,22 @@ Tout le corps de `main()` est enveloppé dans un `try / except Exception` :
 - **`load_dotenv(env_path)`** (bibliothèque `python-dotenv`) : charge les
   variables du fichier `.env` dans les variables d'environnement du processus.
 - Relit les valeurs via `os.getenv(...)` et les range dans un dictionnaire :
-  `RepFicAenvoyer`, `DateFicAenvoyer`, `BaseUsers`, `FicLog`, `ModeTest`
-  (optionnel) et `base_dir`.
+  `RepFicAenvoyer`, `DateFicAenvoyer`, `BaseUsers`, `FicLog`, `FicLogTrtComplet`
+  (optionnel), `ModeTest` (optionnel) et `base_dir`.
 - Contrôle que les 4 variables obligatoires sont présentes (liste
   `manquantes`) ; sinon lève une `RuntimeError` listant celles manquantes.
+  `FicLogTrtComplet` et `ModeTest` sont **optionnels** (absents = ignorés).
 - **Retourne** le dictionnaire de configuration.
 
-### 4.2 `log_debut(fic_log)` (ligne 101) — ligne DEBUT du log
+### 4.2 `log_debut(fichiers)` (ligne 116) — ligne DEBUT du log
 
 - Formate la date/heure courante au format `%d/%m/%Y %H:%M:%S`
   (ex. `01/10/2026 23:40:09`).
-- Écrit dans le fichier de log une ligne encadrée par `SEP_LOG`
-  (`SEP_LOG = "*" * 55`, soit 55 astérisques) indiquant
+- Écrit dans **chacun** des fichiers de la liste `fichiers` une ligne encadrée par
+  `SEP_LOG` (`SEP_LOG = "*" * 51`, soit 51 astérisques — identique au séparateur
+  employé par le traitement Access) indiquant
   `DEBUT création base hors-ligne - Envoi par mail...`.
-- L'écriture passe par le petit utilitaire `_writelog` (voir §4.8).
+- L'écriture passe par les utilitaires `_write_multi` → `_writelog` (voir §4.8).
 
 ### 4.3 `identifier_archive(rep_fic, date_fic)` (ligne 165) — trouve le `.7z`
 
@@ -292,14 +294,15 @@ Séquence de **tokens GroupWise** exécutés dans l'ordre :
 > - pour le **corps simple** `CORPS_MAIL` (`"Frédéric Rannou"`) : rien à échapper,
 >   on applique par sécurité un échappement des guillemets `"` → `\"`.
 
-### 4.7 `log_fin(fic_log, ddebut)` (ligne 120) — ligne FIN + durée
+### 4.7 `log_fin(fichiers, ddebut)` (ligne 126) — ligne FIN + durée
 
 - Formate la date/heure courante.
 - Calcule la **durée** : `datetime.datetime.now() - ddebut` (un objet
   `timedelta`).
 - Convertit la durée en `HH:MM:SS` avec `divmod` (division entière pour les
   heures, puis minutes, puis secondes).
-- Écrit la ligne `FIN... (HH:MM:SS)` dans le log.
+- Écrit la ligne `FIN... (HH:MM:SS)` dans **chacun** des fichiers de la liste
+  `fichiers`.
 
 ### 4.8 `_writelog(fic_log, texte)` (ligne 98) — écriture dans le log
 
@@ -308,6 +311,9 @@ Séquence de **tokens GroupWise** exécutés dans l'ordre :
   rester **lisible par le même fichier de log commun**.
 - Ouvre le fichier de log en **mode append** (`"a"`) et écrit le texte suivi d'un
   retour à la ligne (`os.linesep`).
+- `_write_multi(fichiers, texte)` (ligne 110) applique simplement `_writelog`
+  à chaque fichier de la liste `fichiers`, ce qui permet d'écrire la même ligne
+  dans `FicLog` et `FicLogTrtComplet`.
 
 > **Notion Python** : écrire en mode `"a"` **ajoute** à la fin du fichier sans
 > écraser son contenu existant — indispensable pour un fichier de log partagé.

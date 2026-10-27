@@ -28,6 +28,9 @@ Configuration (fichier .env, variables) :
     NomFichierWord     = nom du fichier Word (mode opératoire) présent dans RepFicAenvoyer
     BaseUsers          = chemin complet de la base Access (table TbUsers)
     FicLog             = chemin complet du fichier de log commun (mode append)
+    FicLogTrtComplet   = (optionnel) chemin d'un second fichier de log (log global
+                         de l'ensemble du traitement). S'il est défini, les lignes
+                         DEBUT / infos / FIN sont également écrites dans ce fichier.
 
 Sortie :
     Code de retour 0 si succès, 1 en cas d'erreur.
@@ -74,7 +77,10 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Constantes du cahier des charges
 # ---------------------------------------------------------------------------
-SEP_LOG = "*" * 55
+# Séparateur de log : 51 astérisques, strictement identique au séparateur employé
+# par le traitement Access afin de rester cohérent dans le fichier de log commun
+# (FicLogTrtComplet / TT_Import.log).
+SEP_LOG = "*" * 51
 
 LIEN_COPIE_EXCEL = (
     "G:\\DM-SURVEIL\\MEDICAMENTS\\BASES\\BASE_CM\\Import_TT\\ImportExcel_TT\\PROD\\aFaire\\"
@@ -95,32 +101,43 @@ def _writelog(fic_log, texte):
     L'encodage suit celui de l'OS (ANSI/Windows-1252 sous Windows), identique
     à celui employé par le traitement Access pour rester lisible par le même
     fichier de log commun.
+
+    On ajoute un simple '\\n' : en mode texte sous Windows, Python le traduit en
+    '\\r\\n' (CRLF) — la fin de ligne employée par Access. Utiliser os.linesep
+    (déjà '\\r\\n') provoquerait un double retour '\\r\\r\\n' et donc une ligne
+    vide parasite une ligne sur deux dans le fichier de log partagé.
     """
     enc = locale.getpreferredencoding(False) or "utf-8"
     with open(fic_log, "a", encoding=enc) as fh:
-        fh.write(texte + os.linesep)
+        fh.write(texte + "\n")
 
 
-def log_debut(fic_log):
-    """Ligne DEBUT conforme au cahier des charges."""
+def _write_multi(fichiers, texte):
+    """Écrit '<texte>' dans chacun des fichiers de la liste 'fichiers'."""
+    for fic in fichiers:
+        _writelog(fic, texte)
+
+
+def log_debut(fichiers):
+    """Ligne DEBUT conforme au cahier des charges, écrite dans chaque fichier."""
     now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    _writelog(
-        fic_log,
+    _write_multi(
+        fichiers,
         f"{SEP_LOG} DEBUT création base hors-ligne - Envoi par mail de la base "
         f"hors-ligne - {now} {SEP_LOG}",
     )
 
 
-def log_fin(fic_log, ddebut):
-    """Ligne FIN (avec durée) conforme au cahier des charges."""
+def log_fin(fichiers, ddebut):
+    """Ligne FIN (avec durée) conforme au cahier des charges, dans chaque fichier."""
     now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     duree = datetime.datetime.now() - ddebut
     total = int(duree.total_seconds())
     hh, rem = divmod(total, 3600)
     mm, ss = divmod(rem, 60)
     duree_txt = f"{hh:02d}:{mm:02d}:{ss:02d}"
-    _writelog(
-        fic_log,
+    _write_multi(
+        fichiers,
         f"{SEP_LOG}  FIN  création base hors-ligne - Envoi par mail de la base "
         f"hors-ligne - {now} ({duree_txt}) {SEP_LOG}",
     )
@@ -146,6 +163,8 @@ def charger_config():
         "NomFichierWord": os.getenv("NomFichierWord"),
         "BaseUsers": os.getenv("BaseUsers"),
         "FicLog": os.getenv("FicLog"),
+        # Optionnel : log global de l'ensemble du traitement (en plus de FicLog)
+        "FicLogTrtComplet": os.getenv("FicLogTrtComplet", ""),
         # Optionnel : 1 / true / dryrun => TEST sans envoi réel du mail
         "ModeTest": os.getenv("ModeTest", ""),
         "base_dir": base_dir,
@@ -154,7 +173,7 @@ def charger_config():
     manquantes = [
         cle
         for cle, val in valeurs.items()
-        if cle not in ("base_dir", "ModeTest") and not val
+        if cle not in ("base_dir", "ModeTest", "FicLogTrtComplet") and not val
     ]
     if manquantes:
         raise RuntimeError(
@@ -418,6 +437,7 @@ def main():
     """Pilote l'ensemble du processus et renvoie un code de retour."""
     ddebut = datetime.datetime.now()
     config = None
+    fichier_logs = None
 
     try:
         config = charger_config()
@@ -427,8 +447,14 @@ def main():
         base_users = config["BaseUsers"]
         fic_log = config["FicLog"]
 
-        # Ligne DEBUT dans le log commun
-        log_debut(fic_log)
+        # Liste des fichiers de log : FicLog (toujours) + FicLogTrtComplet (si défini)
+        fichier_logs = [fic_log]
+        ficlog_trt = config.get("FicLogTrtComplet", "").strip()
+        if ficlog_trt:
+            fichier_logs.append(ficlog_trt)
+
+        # Ligne DEBUT dans le(s) fichier(s) de log
+        log_debut(fichier_logs)
 
         # --- 1. Identification de l'archive .7z à envoyer ---
         archive = identifier_archive(rep_fic, date_fic)
@@ -436,10 +462,10 @@ def main():
         # --- 2. Lecture des destinataires TO / CC ---
         to_liste = lire_destinataires(base_users, "EnvoiMail_TT_To_CM")
         if not to_liste:
-            _writelog(fic_log, "pas de destinataires TO ")
+            _write_multi(fichier_logs, "pas de destinataires TO ")
         cc_liste = lire_destinataires(base_users, "EnvoiMail_TT_Cc_CM")
         if not cc_liste:
-            _writelog(fic_log, "pas de destinataires CC ")
+            _write_multi(fichier_logs, "pas de destinataires CC ")
 
         # --- 3. Pièces jointes à envoyer ---
         #   - l'archive .7z identifiée ci-dessus
@@ -456,16 +482,26 @@ def main():
         # Date affichée dans le corps du mail, extraite du nom de l'archive
         _, _, date_archive = extraire_date_archive(archive)
 
+        # --- Infos pertinentes intercalées entre DEBUT et FIN (log global) ---
+        _write_multi(fichier_logs, f"Envoi du fichier (archive) : {os.path.basename(archive)}")
+        _write_multi(fichier_logs, f"Date de la base hors-ligne : {date_archive}")
+        _write_multi(
+            fichier_logs,
+            f"Destinataires TO ({len(to_liste)}) : " + (", ".join(to_liste) if to_liste else "(aucun)"),
+        )
+        _write_multi(
+            fichier_logs,
+            f"Destinataires CC ({len(cc_liste)}) : " + (", ".join(cc_liste) if cc_liste else "(aucun)"),
+        )
+        _write_multi(fichier_logs, f"Fichier Word joint : {os.path.basename(fichier_word)}")
+
         # --- Corps du mail (texte simple, la date est rendue dynamiquement) ---
         corps_texte = (
             f"Voici la base cas marquant \"hors ligne\" du {date_archive} au soir "
             "ainsi que son mode opératoire.\n\n"
             "Si vous désirez modifier un cas marquant, vous devez impérativement, "
             "utiliser la dernière base envoyée, il s'agit de la plus à jour.\n\n"
-            "Il est également nécessaire d’envoyer les fichiers générés le jour même, "
-            "et ainsi réduire le risque de collisions de modification "
-            "(modifications du même cas marquant par deux utilisateurs différents).\n\n"
-            "Merci de copier les fichiers Excel dans le répertoire suivant : "
+            "Dans ce cas, vos modifications seront exportées automatiquement, via un fichier Excel, dans le répertoire suivant : "
             "G:\\DM-SURVEIL\\MEDICAMENTS\\BASES\\BASE_CM\\Import_TT\\ImportExcel_TT\\PROD\\aFaire\\\n\n"
             "Frédéric Rannou"
         )
@@ -503,7 +539,7 @@ def main():
             print("-" * 60)
             print("Le mail n'a PAS été envoyé (mode test).")
             print("=" * 60)
-            log_fin(fic_log, ddebut)
+            log_fin(fichier_logs, ddebut)
             return 0
 
         # --- 4. Envoi via GroupWise ---
@@ -523,20 +559,25 @@ def main():
         #     pass
 
         # --- 5. Fin de traitement (ligne FIN + durée) ---
-        log_fin(fic_log, ddebut)
+        log_fin(fichier_logs, ddebut)
 
         print("Envoi effectué avec succès.")
         return 0
 
     except Exception as exc:  # pragma: no cover
-        # Journalise l'erreur (et une ligne FIN) dans le log commun si possible
+        # Journalise l'erreur (et une ligne FIN) dans le(s) fichier(s) de log
+        # si possible. On réutilise la liste déjà construite (FicLog +
+        # FicLogTrtComplet), sinon on retombe sur FicLog seul.
         try:
-            if config and config.get("FicLog"):
-                _writelog(
-                    config["FicLog"],
+            logs_except = fichier_logs
+            if not logs_except and config and config.get("FicLog"):
+                logs_except = [config["FicLog"]]
+            if logs_except:
+                _write_multi(
+                    logs_except,
                     f"ERREUR envoi par mail de la base hors-ligne : {exc}",
                 )
-                log_fin(config["FicLog"], ddebut)
+                log_fin(logs_except, ddebut)
         except Exception:
             pass
 

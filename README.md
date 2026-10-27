@@ -77,6 +77,7 @@ Variables :
 | `DateFicAenvoyer` | `today` (date du jour) **ou** une date exacte `AAAAMMJJ`               |
 | `BaseUsers`       | Chemin complet de la base Access (table `TbUsers`)                     |
 | `FicLog`          | Chemin complet du fichier de log commun (mode append)                  |
+| `FicLogTrtComplet`| *(optionnel)* Chemin d'un second fichier de log (log global du traitement) → les lignes DEBUT/infos/FIN y sont aussi écrites |
 | `ModeTest`        | *(optionnel)* `1`/`true`/`dryrun` → TEST **sans envoi** réel du mail    |
 
 > **Important** : ne mettez **pas** de guillemets autour des valeurs.
