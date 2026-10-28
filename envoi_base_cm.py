@@ -40,8 +40,10 @@ import os
 import sys
 import re
 import glob
+import time
 import locale
 import datetime
+import subprocess
 
 # ---------------------------------------------------------------------------
 # Dépendances (messages clairs si manquantes)
@@ -67,9 +69,12 @@ except ImportError:  # pragma: no cover
 try:
     import win32com.client
     import win32clipboard
+    import win32con
+    import win32gui
 except ImportError:  # pragma: no cover
     sys.stderr.write(
-        "ERREUR : la bibliothèque 'pywin32' est requise (modules win32com et win32clipboard).\n"
+        "ERREUR : la bibliothèque 'pywin32' est requise (modules win32com, "
+        "win32clipboard, win32con et win32gui).\n"
         "Installez-la avec : pip install pywin32\n"
     )
     sys.exit(1)
@@ -167,13 +172,17 @@ def charger_config():
         "FicLogTrtComplet": os.getenv("FicLogTrtComplet", ""),
         # Optionnel : 1 / true / dryrun => TEST sans envoi réel du mail
         "ModeTest": os.getenv("ModeTest", ""),
+        # Optionnel : mot de passe GroupWise saisi automatiquement (directement
+        # dans le champ de connexion) lorsque le client GroupWise n'est pas déjà
+        # ouvert / connecté au lancement.
+        "MDPgroupWise": os.getenv("MDPgroupWise", ""),
         "base_dir": base_dir,
     }
 
     manquantes = [
         cle
         for cle, val in valeurs.items()
-        if cle not in ("base_dir", "ModeTest", "FicLogTrtComplet") and not val
+        if cle not in ("base_dir", "ModeTest", "FicLogTrtComplet", "MDPgroupWise") and not val
     ]
     if manquantes:
         raise RuntimeError(
@@ -344,6 +353,226 @@ def _decouper_corps(texte, taille_max=200):
     return segments
 
 
+# ---------------------------------------------------------------------------
+# Démarrage / connexion automatique du client GroupWise
+# ---------------------------------------------------------------------------
+# Le client de messagerie GroupWise (OpenText GroupWise CE) est lancé via son
+# exécutable `grpwise.exe`. On recherche cet exécutable dans les dossiers
+# d'installation classiques (32 bits puis 64 bits). La détection de l'état
+# "GroupWise ouvert / fenêtre de connexion" se fait par le TITRE des fenêtres
+# Windows (qui contient "GroupWise", ex. "Mot de passe GroupWise" ou
+# "OpenText GroupWise - Boîte aux lettres") et non par le nom du processus :
+# ce dernier s'avère peu fiable (module inaccessible, client "GroupWise CE").
+GROUPWISE_EMPLACEMENTS = [
+    r"C:\Program Files (x86)\Novell\GroupWise\grpwise.exe",
+    r"C:\Program Files\Novell\GroupWise\grpwise.exe",
+    r"C:\Program Files (x86)\GroupWise\grpwise.exe",
+    r"C:\Program Files\GroupWise\grpwise.exe",
+]
+
+# Délais (en secondes) utilisés pour l'automatisation d'interface :
+# - attente de l'apparition de la fenêtre de connexion GroupWise après lancement ;
+# - pause après la frappe du mot de passe pour laisser GroupWise s'authentifier.
+ATTENTE_FENETRE_CONNEXION_S = 30
+ATTENTE_AUTHENTIFICATION_S = 12
+
+# Sous-chaînes (insensibles à la casse) présentes dans le TITRE de la fenêtre
+# de connexion GroupWise (ex. "Mot de passe GroupWise") et dans la fenêtre de
+# la boîte aux lettres (ex. "OpenText GroupWise - Boîte aux lettres").
+CLE_TITRE_GROUPWISE = "groupwise"
+CLE_TITRE_MOT_DE_PASSE = ("mot de passe", "password", "motdepasse")
+CLE_TITRE_BOITE_AUX_LETTRES = ("boîte aux lettres", "boite aux lettres", "mailbox")
+
+
+def _trouver_executable_groupwise():
+    """Retourne le chemin de `grpwise.exe` s'il existe, sinon ``None``."""
+    for chemin in GROUPWISE_EMPLACEMENTS:
+        if os.path.isfile(chemin):
+            return chemin
+    return None
+
+
+def _windows_visibles_avec(cle):
+    """Retourne la liste des (hwnd, titre) des fenêtres visibles de premier
+    niveau dont le titre (minuscules) contient `cle` (insensible à la casse)."""
+    resultats = []
+
+    def _callback(hwnd, _unused):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        try:
+            titre = win32gui.GetWindowText(hwnd)
+        except Exception:
+            return
+        if titre and cle in titre.lower():
+            resultats.append((hwnd, titre))
+
+    try:
+        win32gui.EnumWindows(_callback, None)
+    except Exception:  # pragma: no cover
+        return []
+    return resultats
+
+
+def _groupwise_est_ouvert():
+    """Renvoie ``True`` si une fenêtre visible du client GroupWise existe.
+
+    Une fenêtre GroupWise est détectée dès que son titre contient "GroupWise"
+    (fenêtre de connexion, boîte aux lettres, etc.). Si le client est déjà
+    ouvert, on continue la logique actuelle sans retaper de mot de passe.
+    """
+    return bool(_windows_visibles_avec(CLE_TITRE_GROUPWISE))
+
+
+def _hwnd_fenetre_connexion():
+    """Retourne le hwnd de la fenêtre de connexion GroupWise (demande de mot de
+    passe), sinon ``None``.
+
+    La fenêtre ciblée est celle dont le titre contient "GroupWise" ET l'un des
+    mots-clés "mot de passe"/"password". Si elle n'est pas trouvée mais qu'une
+    fenêtre "Boîte aux lettres" est déjà présente (GroupWise déjà connecté),
+    on renvoie ``None`` sans lever : il n'y a alors rien à saisir.
+    """
+    for cle in CLE_TITRE_MOT_DE_PASSE:
+        for hwnd, titre in _windows_visibles_avec(cle):
+            if CLE_TITRE_GROUPWISE in titre.lower():
+                return hwnd
+    return None
+
+
+def _groupwise_deja_connecte():
+    """Renvoie ``True`` si la fenêtre de la boîte aux lettres GroupWise est
+    déjà affichée (GroupWise déjà connecté et prêt)."""
+    for cle in CLE_TITRE_BOITE_AUX_LETTRES:
+        for hwnd, titre in _windows_visibles_avec(cle):
+            if CLE_TITRE_GROUPWISE in titre.lower():
+                return True
+    return False
+
+
+def _controles_connexion(hwnd_fenetre):
+    """Retourne ``(hwnd_edit, hwnd_bouton_ok)`` des contrôles enfants de la
+    fenêtre de connexion ``hwnd_fenetre``, ou ``(None, None)`` si introuvables.
+
+    La fenêtre de connexion "Mot de passe GroupWise" contient un champ de
+    saisie (classe ``Edit``) qui reçoit le mot de passe, et un bouton ``OK``
+    (classe ``Button`` dont le libellé commence par "OK"). Cibler directement
+    ces contrôles (via ``SendMessage``/``WM_SETTEXT`` + ``BM_CLICK``) est bien
+    plus fiable que d'envoyer des touches via SendKeys, qui dépend du focus.
+    """
+    hwnd_edit = None
+    hwnd_ok = None
+
+    def _callback(hwnd, _unused):
+        nonlocal hwnd_edit, hwnd_ok
+        try:
+            classe = win32gui.GetClassName(hwnd)
+            texte = win32gui.GetWindowText(hwnd)
+        except Exception:
+            return
+        if classe == "Edit" and hwnd_edit is None:
+            hwnd_edit = hwnd
+        elif classe == "Button" and texte.strip().lower().startswith("ok"):
+            hwnd_ok = hwnd
+
+    try:
+        win32gui.EnumChildWindows(hwnd_fenetre, _callback, None)
+    except Exception:  # pragma: no cover
+        return None, None
+    return hwnd_edit, hwnd_ok
+
+
+def _lancer_groupwise():
+    """Lance le client GroupWise s'il n'est pas déjà ouvert.
+
+    Recherche `grpwise.exe` dans les emplacements connus. Si introuvable,
+    on lance quand même GroupwiseCommander (qui démarre le client à sa façon).
+    """
+    executable = _trouver_executable_groupwise()
+    if executable:
+        # Démarrage sans attendre le retour du processus
+        subprocess.Popen([executable])
+    else:
+        # Fallback : l'objet GroupwiseCommander peut démarrer le client lui-même.
+        try:
+            win32com.client.Dispatch("GroupwiseCommander")
+        except Exception:
+            # On laisse l'appelant tenter de continuer ; l'erreur remontera
+            # ensuite au moment de l'envoi si GroupWise n'a pas pu démarrer.
+            return
+
+
+def _saisir_mot_de_passe_groupwise(mdp):
+    """Attend la fenêtre de connexion GroupWise et y saisit le mot de passe.
+
+    - Attend (jusqu'à ATTENTE_FENETRE_CONNEXION_S) l'apparition de la fenêtre
+      de connexion dont le titre contient "mot de passe"/"password" ;
+    - envoie le mot de passe directement dans le champ "Edit" de cette fenêtre
+      (WM_SETTEXT) puis clique sur le bouton OK (BM_CLICK), indépendamment du
+      focus ; en secours, retombe sur un envoi de touches SendKeys + Entrée ;
+    - laisse un court délai pour que GroupWise s'authentifie.
+
+    Cas particuliers gérés :
+      * GroupWise se connecte sans demander de mot de passe (fenêtre "Boîte
+        aux lettres" déjà affichée) → rien n'est saisi, on retourne simplement ;
+      * Aucune fenêtre de connexion n'apparaît dans le délai → erreur claire.
+
+    :param mdp: mot de passe GroupWise (variable MDPgroupWise du .env).
+    """
+    coque = win32com.client.Dispatch("WScript.Shell")
+
+    # 1. Attente de l'apparition de la fenêtre de connexion
+    hwnd = None
+    debut = time.time()
+    while time.time() - debut < ATTENTE_FENETRE_CONNEXION_S:
+        if _groupwise_deja_connecte():
+            # GroupWise s'est connecté sans mot de passe : rien à saisir.
+            return
+        hwnd = _hwnd_fenetre_connexion()
+        if hwnd is not None:
+            break
+        time.sleep(0.5)
+
+    if hwnd is None:
+        raise RuntimeError(
+            "GroupWise a été lancé mais aucune fenêtre de connexion (mot de "
+            "passe) n'est apparue dans le délai imparti. Mot de passe non saisi."
+        )
+
+    # 2. Mise au premier plan de la fenêtre GroupWise (améliore la fiabilité si
+    #    on doit retomber sur l'envoi de touches).
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        # Le focus peut parfois être refusé ; on tente quand même la saisie.
+        pass
+    time.sleep(1.0)
+
+    # 3. Saisie du mot de passe puis validation.
+    #    Approche privilégiée : envoyer le mot de passe directement au champ
+    #    "Edit" de la fenêtre (WM_SETTEXT) puis cliquer sur le bouton "OK"
+    #    (BM_CLICK). C'est indépendant du focus et donc bien plus fiable que
+    #    SendKeys. Si les contrôles ne sont pas trouvés, on retombe sur
+    #    SendKeys (focus de la fenêtre déjà mis au premier plan en étape 2).
+    hwnd_edit, hwnd_ok = _controles_connexion(hwnd)
+    if hwnd_edit is not None and hwnd_ok is not None:
+        # Le contenu du champ Edit n'apparaît pas avec GetWindowText car c'est
+        # un champ mot de passe (masqué) ; WM_SETTEXT le remplit correctement.
+        win32gui.SendMessage(hwnd_edit, win32con.WM_SETTEXT, 0, str(mdp))
+        time.sleep(0.5)
+        win32gui.SendMessage(hwnd_ok, win32con.BM_CLICK, 0, 0)
+    else:
+        # Fallback par envoi de touches (moins fiable mais couvre les cas où la
+        # fenêtre a une structure différente).
+        mdp_safe = str(mdp).replace("{", "{{").replace("}", "}}")
+        coque.SendKeys(mdp_safe)
+        time.sleep(0.5)
+        coque.SendKeys("{ENTER}")
+
+    # 4. Délai pour laisser GroupWise s'authentifier
+    time.sleep(ATTENTE_AUTHENTIFICATION_S)
+
+
 class GroupWiseCommander:
     """Encapsule l'objet OLE GroupwiseCommander et l'exécution des tokens."""
 
@@ -356,6 +585,40 @@ class GroupWiseCommander:
                 f"{exc}\nVérifiez que le client GroupWise 32 bits est installé "
                 "et enregistré, et que ce script tourne en Python 32 bits (x86)."
             ) from exc
+
+    def connecter(self, mdp):
+        """Garantit que le client GroupWise est ouvert ET connecté.
+
+        - Si la boîte aux lettres GroupWise est déjà affichée (session
+          connectée), ne fait rien (on reprend la logique actuelle).
+        - Sinon, s'assure que le client est lancé, attend la fenêtre de
+          connexion, y saisit le mot de passe ``mdp`` (variable MDPgroupWise du
+          .env) et valide (via le bouton OK), puis laisse GroupWise
+          s'authentifier.
+
+        :param mdp: mot de passe GroupWise (chaîne) ; s'il est vide et qu'une
+                    connexion est nécessaire, on lève une erreur claire.
+        """
+        if _groupwise_deja_connecte():
+            # GroupWise est déjà connecté (boîte aux lettres ouverte) : rien à
+            # faire, on reprend exactement la logique actuelle.
+            return
+
+        if not mdp:
+            raise RuntimeError(
+                "GroupWise n'est pas connecté et la variable 'MDPgroupWise' "
+                "n'est pas renseignée dans le fichier .env. Impossible de "
+                "saisir le mot de passe automatiquement."
+            )
+
+        print("GroupWise non connecté : vérification/lancement du client et "
+              "saisie du mot de passe...")
+        # Si le client n'est même pas ouvert (aucune fenêtre GroupWise visible),
+        # on le lance. S'il est déjà ouvert mais en attente de mot de passe
+        # (fenêtre "Mot de passe GroupWise"), on lance quand même la saisie.
+        if not _groupwise_est_ouvert():
+            _lancer_groupwise()
+        _saisir_mot_de_passe_groupwise(mdp)
 
     def executer(self, commande):
         """Exécute un token GroupWise et lève une erreur en cas d'échec.
@@ -544,6 +807,18 @@ def main():
 
         # --- 4. Envoi via GroupWise ---
         commander = GroupWiseCommander()
+        # Si la session GroupWise n'est pas déjà connectée (boîte aux lettres
+        # ouverte), on s'assure de la connexion (lancement + saisie du mot de
+        # passe MDPgroupWise le cas échéant) avant d'envoyer le mail.
+        mdp_groupwise = config.get("MDPgroupWise", "")
+        if not _groupwise_deja_connecte():
+            if mdp_groupwise:
+                _write_multi(
+                    fichier_logs,
+                    "GroupWise non connecté : saisie automatique du mot de passe "
+                    "MDPgroupWise avant envoi.",
+                )
+            commander.connecter(mdp_groupwise)
         commander.envoyer_mail(
             to_liste=to_liste,
             cc_liste=cc_liste,
