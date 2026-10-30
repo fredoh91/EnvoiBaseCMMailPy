@@ -96,6 +96,16 @@ SUJET_MAIL = (
     "en période de télétravail"
 )
 
+# Séparateur d'arguments utilisé dans la commande d'un token GroupwiseCommander
+# lorsqu'on lui passe un second argument (le booléen `Append`).
+# Le SDK déclare la syntaxe :  VOID TextSetTo( ANSISTRING ToText; [BOOLEAN Append])
+# -> séparateur par défaut = point-virgule (conforme au SDK).
+# Ce format a été validé sur machine réelle (brouillon GroupWise sans envoi) :
+# `TextSetTo("adr"; True)` résout correctement le destinataire, alors que
+# `TextSetTo("adr", True)` (virgule) échoue. Ne pas basculer sur ",".
+SEP_ARG_TOKEN = ";"
+
+
 
 # ---------------------------------------------------------------------------
 # Journalisation (mode append) - format identique au VBA / Access
@@ -644,20 +654,44 @@ class GroupWiseCommander:
             )
         return ret_string
 
+    def _set_destinataires(self, token, liste):
+        """Ajoute chaque destinataire de `liste` un par un via le token GroupWise.
+
+        Le token GroupwiseCommander `TextSetTo` / `TextSetCC` insère **un seul**
+        user_id par appel et dispose d'un paramètre booléen optionnel `Append`
+        (`True` = ajoute au champ existant, `False`/omis = remplace). Passer une
+        liste concaténée par des virgules en un seul appel fait que GroupWise
+        interprète toute la chaîne comme UNE adresse invalide (champ destinataire
+        incohérent, envoi impossible). On reproduit donc la logique du VBA
+        d'origine (`objRecipients.Add(...)` en boucle) : un appel par adresse,
+        avec `Append=True` pour toutes les adresses sauf la première.
+
+        :param token: nom du token, ex. "TextSetTo" ou "TextSetCC".
+        :param liste: liste (non vide) d'adresses mail à insérer.
+        """
+        for i, adresse in enumerate(liste):
+            adr = _echapper_pour_cmd(adresse, mono_ligne=False)
+            if i == 0:
+                # Premier destinataire : remplace le contenu du champ.
+                self.executer(f'{token}("{adr}")')
+            else:
+                # Destinataires suivants : ajout au contenu existant.
+                self.executer(
+                    f'{token}("{adr}"{SEP_ARG_TOKEN} True)'
+                )
+
     def envoyer_mail(self, to_liste, cc_liste, sujet, corps, pieces_jointes):
         """Compose et envoie le courriel via les tokens GroupWise."""
         # 1. Nouveau brouillon
         self.executer("NewMail()")
 
-        # 2. Destinataires TO (liste séparée par des virgules)
+        # 2. Destinataires TO (un appel par adresse, Append pour les suivantes)
         if to_liste:
-            to_texte = ",".join(to_liste)
-            self.executer(f'TextSetTo("{to_texte}")')
+            self._set_destinataires("TextSetTo", to_liste)
 
-        # 3. Destinataires CC
+        # 3. Destinataires CC (un appel par adresse, Append pour les suivantes)
         if cc_liste:
-            cc_texte = ",".join(cc_liste)
-            self.executer(f'TextSetCC("{cc_texte}")')
+            self._set_destinataires("TextSetCC", cc_liste)
 
         # 4. Objet du message
         self.executer(f'TextSetSubject("{sujet}")')
@@ -788,17 +822,37 @@ def main():
             print(f"                         {fichier_word}")
             print("-" * 60)
             # Reconstruit les commandes GroupWise (sans les exécuter) pour
-            # vérifier que le corps et les pièces jointes sont bien formatés.
+            # vérifier que les destinataires, le corps et les pièces jointes
+            # sont bien formatés. Les destinataires sont ajoutés UN PAR UN
+            # (cf. _set_destinataires) avec Append=True pour les suivants.
+            def _cmd_dest(token, liste):
+                lignes = []
+                if not liste:
+                    lignes.append(f"  (aucun destinataire pour {token})")
+                    return lignes
+                for i, adr in enumerate(liste):
+                    adr_s = _echapper_pour_cmd(adr, mono_ligne=False)
+                    if i == 0:
+                        lignes.append(f'  {token}("{adr_s}")')
+                    else:
+                        lignes.append(
+                            f'  {token}("{adr_s}"{SEP_ARG_TOKEN} True)'
+                        )
+                return lignes
+
             print("Commandes GroupWise qui seraient envoyées :")
-            print(f"  NewMail()")
-            print(f"  TextSetTo(\"{_echapper_pour_cmd(','.join(to_liste), mono_ligne=False) if to_liste else ''}\")")
+            print("  NewMail()")
+            for ligne in _cmd_dest("TextSetTo", to_liste):
+                print(ligne)
+            for ligne in _cmd_dest("TextSetCC", cc_liste):
+                print(ligne)
             print(f"  TextSetSubject(\"{_echapper_pour_cmd(SUJET_MAIL, mono_ligne=False)}\")")
             print("  [Copie du corps dans le presse-papier Windows (CF_UNICODETEXT) avec sauts de ligne réels]")
             print("  FocusSet(10)")
             print("  EditPaste()")
             for chemin in pieces_jointes:
                 print(f"  AttachmentAdd(\"{_echapper_pour_cmd(chemin, mono_ligne=False)}\")")
-            print(f"  ItemSend()")
+            print("  ItemSend()")
             print("-" * 60)
             print("Le mail n'a PAS été envoyé (mode test).")
             print("=" * 60)

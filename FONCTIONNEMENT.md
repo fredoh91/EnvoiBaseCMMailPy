@@ -265,8 +265,11 @@ Encapsule l'objet **OLE COM** `GroupwiseCommander` (le remplaçant moderne de
 Séquence de **tokens GroupWise** exécutés dans l'ordre :
 
 1. `NewMail()` — crée un nouveau brouillon de mail.
-2. `TextSetTo("<mails séparés par des virgules>")` — remplit le champ **TO**.
-3. `TextSetCC("<mails séparés par des virgules>")` — remplit le champ **CC**.
+2. Destinataires **TO** — **un appel `TextSetTo` par adresse** :
+   `TextSetTo("<mail1>")`, puis `TextSetTo("<mail2>"; True)`, etc. (`Append=True`
+   ajoute au champ existant pour les adresses suivantes).
+3. Destinataires **CC** — idem : **un appel `TextSetCC` par adresse**,
+   `TextSetCC("<mail1>")` puis `TextSetCC("<mail2>"; True)`, etc.
 4. `TextSetSubject("<sujet>")` — définit l'**objet** du mail.
 5. `TextSetMessage("<corps>")` — insère le corps : la constante **`CORPS_MAIL`**
    (`"Frédéric Rannou"`), un **texte simple** (pas du HTML). Le HTML détaillé

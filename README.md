@@ -98,6 +98,12 @@ Deux requêtes sont exécutées (logique issue du VBA) :
 
 Le champ utilisé est `TbUsers.mail`.
 
+> **Destinataires multiples dans GroupWise** : chacun est ajouté au brouillon
+> par **un token par adresse** (`TextSetTo("<mail1>")` puis `TextSetTo("<mail2>"; True)`
+> pour les suivants, idem avec `TextSetCC`), via le paramètre `Append=True`.
+> La concaténation en une seule commande `TextSetTo("mail1,mail2")` produirait une
+> adresse unique invalide (champ destinataire incohérent, envoi impossible).
+
 ---
 
 ## ▶️ Utilisation
